@@ -1,16 +1,18 @@
 // comp duration.jsx
 // Tác giả: GPT-4 for Vietnamese user (Updated by Yuuka)
-// Phiên bản: 6.2
+// Phiên bản: 6.6
 // Chức năng: Bắt đầu từ comp đang hoạt động, chỉnh sửa Duration và FPS cho comp đó
 // và tất cả các comp lồng nhau bên trong. Xử lý từ comp sâu nhất ra ngoài.
 // Kéo dài các layer có thể kéo dài (bao gồm cả Photoshop/ảnh tĩnh) mà không dùng Time Remap.
 // Giao diện có hiển thị thông tin so sánh và danh sách các item bị ảnh hưởng.
 //
-// Update v6.2 (Yuuka):
-// - Sửa lỗi nghiêm trọng: Phục hồi chức năng cascade toggle (bật/tắt hàng loạt)
-//   khi click vào item [COMP]. Giờ đây tất cả các item con sẽ thay đổi
-//   trạng thái active theo comp cha.
-// - Tối ưu hóa logic xác định item con trong cấu trúc cache mới.
+// Update v6.6 (Yuuka):
+// - [CẢI TIẾN] Sửa lỗi hiển thị ký tự lạ ("%") trong đường dẫn backup.
+// - [CẢI TIẾN] Tự động rút gọn đường dẫn backup hiển thị cho gọn gàng (chỉ hiển thị 5 thư mục cuối).
+// - [CẢI TIẾN] Thêm tooltip hiển thị đường dẫn đầy đủ khi di chuột vào đường dẫn backup.
+//
+// Update v6.5 (Yuuka):
+// - [TÍNH NĂNG MỚI] Thêm tùy chọn tự động backup project trước khi thực thi.
 
 (function main() {
 
@@ -71,7 +73,7 @@
 
     // --- FUNCTION ĐỂ TẠO GIAO DIỆN NGƯỜI DÙNG ---
     function createDialog(masterComp) {
-        var dialog = new Window("dialog", "Chỉnh sửa duration v6.2");
+        var dialog = new Window("dialog", "Chỉnh sửa duration v6.6");
         dialog.orientation = "column";
         dialog.alignChildren = ["fill", "top"];
         dialog.spacing = 10;
@@ -278,7 +280,6 @@
             } else {
                 itemData.isActive = !itemData.isActive;
                 
-                // ** FIX: LOGIC CASCADE TOGGLE ĐƯỢC VIẾT LẠI **
                 if (itemData.type === 'comp') {
                     var newStatus = itemData.isActive;
                     var parentCompId = itemData.ae_id;
@@ -314,6 +315,47 @@
         fpsInput.onChanging = updateUI;
         updateUI();
 
+        // --- PANEL TÙY CHỌN ---
+        var optionsPanel = dialog.add("panel", undefined, "Tùy chọn");
+        optionsPanel.orientation = "column"; 
+        optionsPanel.alignment = ["fill", "top"];
+        optionsPanel.alignChildren = ["left", "top"];
+
+        var extendEndTouchingCheckbox = optionsPanel.add("checkbox", undefined, "Chỉ dãn layer chạm đuôi timeline (an toàn)");
+        extendEndTouchingCheckbox.value = true;
+        extendEndTouchingCheckbox.helpTip = "Nếu được chọn, script sẽ chỉ kéo dài các layer có outPoint (điểm kết thúc) bằng với duration của comp cha.";
+
+        // --- TÙY CHỌN BACKUP ---
+        var backupCheckbox = optionsPanel.add("checkbox", undefined, "Backup mỗi khi thực thi");
+        backupCheckbox.value = true;
+
+        var backupPathText;
+        if (app.project.file) { 
+            var fullBackupPath = Folder.decode(app.project.file.path + "/DurationEdit_backup/");
+            
+            var pathComponents = fullBackupPath.split('/');
+            // Loại bỏ phần tử rỗng ở cuối nếu có
+            if (pathComponents[pathComponents.length - 1] == "") {
+                pathComponents.pop();
+            }
+
+            var displayPath;
+            if (pathComponents.length > 5) {
+                displayPath = ".../" + pathComponents.slice(-5).join('/');
+            } else {
+                displayPath = fullBackupPath;
+            }
+
+            backupPathText = optionsPanel.add("statictext", undefined, "Lưu tại: " + displayPath);
+            backupPathText.helpTip = "Đường dẫn đầy đủ: " + fullBackupPath;
+            backupPathText.enabled = false;
+        } else {
+            backupCheckbox.value = false;
+            backupCheckbox.enabled = false;
+            backupPathText = optionsPanel.add("statictext", undefined, "Lưu project để bật tính năng backup.");
+            backupPathText.enabled = false;
+        }
+
         // --- BUTTONS ---
         var buttonGroup = dialog.add("group");
         buttonGroup.orientation = "row";
@@ -324,7 +366,7 @@
         if (dialog.show() === 1) {
             updateUI();
             
-            var activeItems = {}; // Dùng một object duy nhất, vì item ID là duy nhất trong project
+            var activeItems = {};
             for(var i = 0; i < allItemsCache.length; i++) {
                 var itemData = allItemsCache[i];
                 if(itemData.isActive && (itemData.type === 'comp' || itemData.type === 'layer')) {
@@ -336,12 +378,53 @@
                 duration: parseFloat(durationInput.text),
                 frames: parseInt(frameInput.text),
                 fps: parseFloat(fpsInput.text),
-                activeItems: activeItems
+                activeItems: activeItems,
+                onlyExtendEndTouching: extendEndTouchingCheckbox.value,
+                doBackup: backupCheckbox.value && backupCheckbox.enabled
             };
         } else {
             return null;
         }
     }
+    
+    // --- FUNCTION ĐỂ BACKUP PROJECT ---
+    function createBackup() {
+        if (!app.project.file) {
+            return false; 
+        }
+
+        var projectFile = app.project.file;
+        var projectPath = projectFile.path;
+        var projectName = projectFile.name.replace(/\.aep$/i, "");
+
+        var backupFolderPath = projectPath + "/DurationEdit_backup";
+        var backupFolder = new Folder(backupFolderPath);
+
+        if (!backupFolder.exists) {
+            var success = backupFolder.create();
+            if (!success) {
+                alert("Không thể tạo thư mục backup tại:\n" + Folder.decode(backupFolderPath));
+                return false;
+            }
+        }
+
+        var backupIndex = 1;
+        var backupFile;
+        do {
+            var backupFileName = projectName + "_BK_" + backupIndex + ".aep";
+            backupFile = new File(backupFolder.fsName + "/" + backupFileName);
+            backupIndex++;
+        } while (backupFile.exists);
+
+        try {
+            app.project.save(backupFile);
+            return true;
+        } catch (e) {
+            alert("Đã xảy ra lỗi khi tạo file backup:\n" + e.toString());
+            return false;
+        }
+    }
+
 
     // --- FUNCTION ĐỆ QUY ĐỂ THU THẬP CÁC COMP THEO THỨ TỰ TỪ SÂU TỚI NÔNG ---
     function collectNestedComps(comp, collectedArray, processedIDs) {
@@ -370,11 +453,19 @@
     if (userInput === null) {
         return;
     }
+    
+    if (userInput.doBackup) {
+        var backupSuccess = createBackup();
+        if (!backupSuccess) {
+            return; 
+        }
+    }
 
     var newDurationSecs = userInput.duration;
     var newFrames = userInput.frames;
     var newFps = userInput.fps;
     var activeItems = userInput.activeItems;
+    var onlyExtendEndTouching = userInput.onlyExtendEndTouching; 
 
     if (isNaN(newDurationSecs) || newDurationSecs < 0 || isNaN(newFrames) || newFrames < 0 || isNaN(newFps) || newFps <= 0) {
         alert("Giá trị không hợp lệ. Thời lượng/Frame phải là số >= 0. FPS phải là số > 0.");
@@ -398,6 +489,7 @@
     for (var i = 0; i < compsToProcess.length; i++) {
         var currentComp = compsToProcess[i];
         var compWasModified = false;
+        var originalCompDuration = currentComp.duration; 
 
         if (activeItems[currentComp.id]) {
             currentComp.duration = newDuration;
@@ -408,9 +500,14 @@
         for (var j = 1; j <= currentComp.numLayers; j++) {
             var currentLayer = currentComp.layer(j);
             if (activeItems[currentLayer.id] && canLayerBeExtended(currentLayer)) {
-                currentLayer.outPoint = newDuration;
-                 if(!compWasModified) {
-                    compWasModified = true;
+                
+                var touchesTimelineEnd = (Math.abs(currentLayer.outPoint - originalCompDuration) < 0.001);
+
+                if (!onlyExtendEndTouching || (onlyExtendEndTouching && touchesTimelineEnd)) {
+                    currentLayer.outPoint = newDuration;
+                    if(!compWasModified) {
+                        compWasModified = true;
+                    }
                 }
             }
         }
