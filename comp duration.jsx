@@ -1,70 +1,320 @@
-// ChinhSuaCompDeQuy.jsx
-// Tác giả: GPT-4 for Vietnamese user
-// Phiên bản: 3.2
+// comp duration.jsx
+// Tác giả: GPT-4 for Vietnamese user (Updated by Yuuka)
+// Phiên bản: 6.2
 // Chức năng: Bắt đầu từ comp đang hoạt động, chỉnh sửa Duration và FPS cho comp đó
 // và tất cả các comp lồng nhau bên trong. Xử lý từ comp sâu nhất ra ngoài.
 // Kéo dài các layer có thể kéo dài (bao gồm cả Photoshop/ảnh tĩnh) mà không dùng Time Remap.
+// Giao diện có hiển thị thông tin so sánh và danh sách các item bị ảnh hưởng.
+//
+// Update v6.2 (Yuuka):
+// - Sửa lỗi nghiêm trọng: Phục hồi chức năng cascade toggle (bật/tắt hàng loạt)
+//   khi click vào item [COMP]. Giờ đây tất cả các item con sẽ thay đổi
+//   trạng thái active theo comp cha.
+// - Tối ưu hóa logic xác định item con trong cấu trúc cache mới.
 
 (function main() {
 
+    // --- HELPER FUNCTION ĐỂ FORMAT THỜI GIAN (mm:ss:ff) ---
+    function formatTime(timeInSeconds, fps) {
+        if (isNaN(timeInSeconds) || isNaN(fps) || fps <= 0) {
+            return "00:00:00";
+        }
+        var totalFrames = Math.round(timeInSeconds * fps);
+        var frames = totalFrames % Math.round(fps);
+        var totalSeconds = Math.floor(totalFrames / fps);
+        var seconds = totalSeconds % 60;
+        var minutes = Math.floor(totalSeconds / 60);
+
+        var mStr = (minutes < 10 ? "0" : "") + minutes;
+        var sStr = (seconds < 10 ? "0" : "") + seconds;
+        var fStr = (frames < 10 ? "0" : "") + frames;
+
+        return mStr + ":" + sStr + ":" + fStr;
+    }
+
+    // --- FUNCTION ĐỂ KIỂM TRA LAYER CÓ THỂ KÉO DÀI ĐƯỢỢC KHÔNG ---
+    function canLayerBeExtended(layer) {
+        if (!(layer instanceof AVLayer)) {
+            // Các layer không có source (Shape, Text, Light, Camera, Null)
+            return true;
+        }
+        var source = layer.source;
+        if (source instanceof CompItem) {
+            // Pre-comp
+            return true;
+        }
+        if (source instanceof FootageItem) {
+            if (source.mainSource instanceof SolidSource) {
+                // Layer Solid
+                return true;
+            }
+            if (source.frameRate === 0) {
+                // Ảnh tĩnh (PSD, PNG, JPG...)
+                return true;
+            }
+        }
+        // Video, Audio, Image Sequence...
+        return false;
+    }
+    
+    // --- FUNCTION ĐỂ KIỂM TRA COMP CÓ ITEM CON CÓ THỂ XỬ LÝ KHÔNG ---
+    function hasListableChildren(comp) {
+        for (var i = 1; i <= comp.numLayers; i++) {
+            var layer = comp.layer(i);
+            if (canLayerBeExtended(layer) || (layer.source && layer.source instanceof CompItem)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
     // --- FUNCTION ĐỂ TẠO GIAO DIỆN NGƯỜI DÙNG ---
-    function createDialog() {
-        var dialog = new Window("dialog", "Chỉnh sửa Comp lồng nhau");
+    function createDialog(masterComp) {
+        var dialog = new Window("dialog", "Chỉnh sửa duration v6.2");
         dialog.orientation = "column";
         dialog.alignChildren = ["fill", "top"];
         dialog.spacing = 10;
         dialog.margins = 16;
 
-        var durationPanel = dialog.add("panel", undefined, "Thiết lập Thời lượng");
-        durationPanel.orientation = "row";
-        durationPanel.alignChildren = ["left", "center"];
-        durationPanel.spacing = 10;
-        durationPanel.margins = 10;
-        durationPanel.add("statictext", undefined, "Thời lượng mới (giây):");
-        var durationInput = durationPanel.add("edittext", undefined, "20"); // Thay đổi giá trị mặc định thành 20
+        var oldDuration = masterComp.duration;
+        var oldFps = masterComp.frameRate;
+
+        // --- PANEL CHỈNH SỬA ---
+        var editPanel = dialog.add("panel", undefined, "Chỉnh sửa");
+        editPanel.orientation = "row";
+        editPanel.alignChildren = ["left", "center"];
+        editPanel.spacing = 10;
+        editPanel.margins = 10;
+
+        var defaultDurationSecs = Math.floor(oldDuration);
+        var defaultFrames = Math.round((oldDuration - defaultDurationSecs) * oldFps);
+
+        editPanel.add("statictext", undefined, "Second(giây)");
+        var durationInput = editPanel.add("edittext", undefined, defaultDurationSecs.toString());
         durationInput.minimumSize.width = 60;
         durationInput.active = true;
-        durationPanel.add("statictext", undefined, "Số frame lẻ:");
-        var frameInput = durationPanel.add("edittext", undefined, "0");
-        frameInput.minimumSize.width = 60;
 
-        var fpsPanel = dialog.add("panel", undefined, "Thiết lập Tốc độ khung hình");
-        fpsPanel.orientation = "row";
-        fpsPanel.alignChildren = ["left", "center"];
-        fpsPanel.spacing = 10;
-        fpsPanel.margins = 10;
-        fpsPanel.add("statictext", undefined, "Frame Rate mới (fps):");
-        var fpsInput = fpsPanel.add("edittext", undefined, "60");
+        editPanel.add("statictext", undefined, "+");
+        var frameInput = editPanel.add("edittext", undefined, defaultFrames.toString());
+        frameInput.minimumSize.width = 60;
+        editPanel.add("statictext", undefined, "frame");
+
+        editPanel.add("statictext", undefined, "FPS");
+        var fpsInput = editPanel.add("edittext", undefined, oldFps.toString());
         fpsInput.minimumSize.width = 60;
 
-        // --- Logic for validation ---
-        var validateFrames = function() {
-            var fps = parseFloat(fpsInput.text);
+        // --- PANEL THÔNG TIN COMP ---
+        var infoPanel = dialog.add("panel", undefined, "Main comp");
+        infoPanel.alignment = "fill";
+        var infoText = infoPanel.add("statictext", undefined, "Loading...", { multiline: false });
+        infoText.preferredSize.width = 400;
+
+        // --- PANEL DANH SÁCH COMPS & LAYERS BỊ ẢNH HƯỞNG ---
+        var allCompsPanel = dialog.add("panel", undefined, "Comps & Layers (Click để Toggle)");
+        allCompsPanel.alignment = "fill";
+        var compTree = allCompsPanel.add("listbox", undefined, [], {
+            numberOfColumns: 5,
+            showHeaders: true,
+            columnTitles: ["#", "Tên Item", "Duration Cũ", "Duration Mới", "Active"]
+        });
+        compTree.alignment = "fill";
+        compTree.columnWidths = [30, 450, 100, 100, 50];
+        compTree.preferredSize.height = 450;
+        compTree.preferredSize.width = 550;
+
+        // --- DATA CACHE: Xây dựng một cây ảo chứa tất cả các item ---
+        var allItemsCache = [];
+
+        function buildCache(comp, indent, parentCacheID, processedIDs) {
+            if (processedIDs[comp.id]) return;
+            processedIDs[comp.id] = true;
+
+            var hasChildren = hasListableChildren(comp);
+            var togglerCacheID = -1;
+
+            if (hasChildren) {
+                var togglerItem = {
+                    type: 'toggler',
+                    text: indent + "-+----------------------------+-",
+                    ae_id: comp.id,
+                    parentCacheID: parentCacheID,
+                    isExpanded: false,
+                    indent: indent,
+                    cacheID: allItemsCache.length
+                };
+                allItemsCache.push(togglerItem);
+                togglerCacheID = togglerItem.cacheID;
+            }
+
+            var compItemData = {
+                type: 'comp',
+                text: indent + (hasChildren ? "  " : "") + "[COMP] " + comp.name,
+                durationOld: formatTime(comp.duration, comp.frameRate),
+                isActive: true,
+                ae_id: comp.id,
+                parentCacheID: parentCacheID,
+                indent: indent + (hasChildren ? "  " : ""),
+                cacheID: allItemsCache.length
+            };
+            allItemsCache.push(compItemData);
+
+            for (var i = 1; i <= comp.numLayers; i++) {
+                var layer = comp.layer(i);
+                var isExtendable = canLayerBeExtended(layer);
+                var isNestedComp = layer.source && layer.source instanceof CompItem;
+
+                if (isExtendable || isNestedComp) {
+                    var layerItemData = {
+                        type: 'layer',
+                        text: compItemData.indent + "  - " + layer.name,
+                        durationOld: formatTime(layer.outPoint - layer.inPoint, comp.frameRate),
+                        isActive: true,
+                        ae_id: layer.id,
+                        parentCacheID: togglerCacheID,
+                        indent: compItemData.indent + "  ",
+                        cacheID: allItemsCache.length
+                    };
+                    allItemsCache.push(layerItemData);
+                }
+
+                if (isNestedComp) {
+                    buildCache(layer.source, compItemData.indent + "    ", togglerCacheID, processedIDs);
+                }
+            }
+        }
+
+        // --- FUNCTION ĐỂ VẼ LẠI DANH SÁCH TỪ CACHE ---
+        function renderList(newDurationStr) {
+            compTree.removeAll();
+            var visibleItemCounter = 1;
+
+            for (var i = 0; i < allItemsCache.length; i++) {
+                var itemData = allItemsCache[i];
+                var isVisible = true;
+
+                if (itemData.parentCacheID !== -1) {
+                    var currentParentID = itemData.parentCacheID;
+                    while(currentParentID !== -1) {
+                        var ancestor = allItemsCache[currentParentID];
+                        if (!ancestor.isExpanded) {
+                            isVisible = false;
+                            break;
+                        }
+                        currentParentID = ancestor.parentCacheID;
+                    }
+                }
+                
+                if (isVisible) {
+                    var listItem;
+                    if (itemData.type === 'toggler') {
+                        listItem = compTree.add("item", "");
+                        listItem.subItems[0].text = itemData.text;
+                    } else {
+                        listItem = compTree.add("item", visibleItemCounter.toString());
+                        listItem.subItems[0].text = itemData.text;
+                        listItem.subItems[1].text = itemData.durationOld;
+                        listItem.subItems[2].text = newDurationStr;
+                        listItem.subItems[3].text = itemData.isActive ? "✓" : "";
+                        visibleItemCounter++;
+                    }
+                    listItem.cacheIndex = itemData.cacheID;
+                }
+            }
+        }
+        
+        var getNewDurationStr = function() {
+             var secs = parseFloat(durationInput.text) || 0;
+             var frames = parseInt(frameInput.text) || 0;
+             var fps = parseFloat(fpsInput.text) || oldFps;
+             if (fps <= 0) fps = oldFps;
+             var newDuration = secs + (frames / fps);
+             return formatTime(newDuration, fps);
+        }
+
+        buildCache(masterComp, "", -1, {});
+        renderList(getNewDurationStr());
+
+        var updateUI = function() {
+            var secs = parseFloat(durationInput.text);
             var frames = parseInt(frameInput.text);
+            var fps = parseFloat(fpsInput.text);
 
+            if (isNaN(secs)) secs = 0;
+            if (isNaN(frames)) frames = 0;
             if (isNaN(fps) || fps <= 0) {
-                return; // Cannot validate if FPS is not a valid positive number
+                fps = oldFps;
             }
 
-            if (isNaN(frames)) {
-                return; // Wait for valid number
-            }
-            
             if (frames < 0) {
                 frameInput.text = "0";
                 frames = 0;
             }
-            
-            if (frames > fps) {
-                frameInput.text = Math.floor(fps).toString();
+            if (frames >= fps) {
+                var maxFrames = Math.floor(fps - 1);
+                frameInput.text = maxFrames < 0 ? "0" : maxFrames.toString();
+                frames = maxFrames < 0 ? 0 : maxFrames;
             }
+
+            var newDuration = secs + (frames / fps);
+            if (newDuration < 0) newDuration = 0;
+
+            var oldInfo = formatTime(oldDuration, oldFps) + "/" + oldFps + "fps";
+            var newInfo = formatTime(newDuration, fps) + "/" + fps + "fps";
+            infoText.text = masterComp.name + " - Old: " + oldInfo + " -> New: " + newInfo;
+            
+            renderList(formatTime(newDuration, fps));
         };
 
-        fpsInput.onChanging = validateFrames;
-        frameInput.onChanging = validateFrames;
-        fpsInput.onChange = validateFrames;
-        frameInput.onChange = validateFrames;
+        // --- EVENT HANDLER CHO DANH SÁCH ---
+        compTree.onChange = function() {
+            if (!this.selection) return;
+            var selectedCacheIndex = this.selection.cacheIndex;
+            var itemData = allItemsCache[selectedCacheIndex];
+            
+            if (itemData.type === 'toggler') {
+                itemData.isExpanded = !itemData.isExpanded;
+                itemData.text = itemData.indent + (itemData.isExpanded ? "--------------------------------" : "-+----------------------------+-");
+            } else {
+                itemData.isActive = !itemData.isActive;
+                
+                // ** FIX: LOGIC CASCADE TOGGLE ĐƯỢC VIẾT LẠI **
+                if (itemData.type === 'comp') {
+                    var newStatus = itemData.isActive;
+                    var parentCompId = itemData.ae_id;
 
+                    for (var i = 0; i < allItemsCache.length; i++) {
+                        var childItem = allItemsCache[i];
+                        if (childItem.cacheID === selectedCacheIndex) continue;
+
+                        var isDescendant = false;
+                        var tempParentID = childItem.parentCacheID;
+                        while (tempParentID !== -1) {
+                            var ancestorToggler = allItemsCache[tempParentID];
+                            if (ancestorToggler.ae_id === parentCompId) {
+                                isDescendant = true;
+                                break;
+                            }
+                            tempParentID = ancestorToggler.parentCacheID;
+                        }
+
+                        if (isDescendant) {
+                            childItem.isActive = newStatus;
+                        }
+                    }
+                }
+            }
+
+            renderList(getNewDurationStr());
+            this.selection = null;
+        };
+
+        durationInput.onChanging = updateUI;
+        frameInput.onChanging = updateUI;
+        fpsInput.onChanging = updateUI;
+        updateUI();
+
+        // --- BUTTONS ---
         var buttonGroup = dialog.add("group");
         buttonGroup.orientation = "row";
         buttonGroup.alignment = ["right", "top"];
@@ -72,8 +322,22 @@
         buttonGroup.add("button", undefined, "Hủy", { name: "cancel" });
 
         if (dialog.show() === 1) {
-            validateFrames(); // Run validation one last time before closing
-            return { duration: durationInput.text, frames: frameInput.text, fps: fpsInput.text };
+            updateUI();
+            
+            var activeItems = {}; // Dùng một object duy nhất, vì item ID là duy nhất trong project
+            for(var i = 0; i < allItemsCache.length; i++) {
+                var itemData = allItemsCache[i];
+                if(itemData.isActive && (itemData.type === 'comp' || itemData.type === 'layer')) {
+                   activeItems[itemData.ae_id] = true;
+                }
+            }
+
+            return {
+                duration: parseFloat(durationInput.text),
+                frames: parseInt(frameInput.text),
+                fps: parseFloat(fpsInput.text),
+                activeItems: activeItems
+            };
         } else {
             return null;
         }
@@ -102,14 +366,15 @@
         return;
     }
 
-    var userInput = createDialog();
+    var userInput = createDialog(masterComp);
     if (userInput === null) {
         return;
     }
 
-    var newDurationSecs = parseFloat(userInput.duration);
-    var newFrames = parseInt(userInput.frames);
-    var newFps = parseFloat(userInput.fps);
+    var newDurationSecs = userInput.duration;
+    var newFrames = userInput.frames;
+    var newFps = userInput.fps;
+    var activeItems = userInput.activeItems;
 
     if (isNaN(newDurationSecs) || newDurationSecs < 0 || isNaN(newFrames) || newFrames < 0 || isNaN(newFps) || newFps <= 0) {
         alert("Giá trị không hợp lệ. Thời lượng/Frame phải là số >= 0. FPS phải là số > 0.");
@@ -128,47 +393,34 @@
     var compsToProcess = [];
     var processedCompIDs = {};
     collectNestedComps(masterComp, compsToProcess, processedCompIDs);
+    var processedCount = 0;
 
     for (var i = 0; i < compsToProcess.length; i++) {
         var currentComp = compsToProcess[i];
+        var compWasModified = false;
 
-        currentComp.duration = newDuration;
-        currentComp.frameRate = newFps;
+        if (activeItems[currentComp.id]) {
+            currentComp.duration = newDuration;
+            currentComp.frameRate = newFps;
+            compWasModified = true;
+        }
 
         for (var j = 1; j <= currentComp.numLayers; j++) {
             var currentLayer = currentComp.layer(j);
-            var canExtend = false;
-
-            if (!(currentLayer instanceof AVLayer)) {
-                // Các layer không có source (Shape, Text, Light, Camera, Null) có thể kéo dài
-                canExtend = true;
-            } else { // Layer có source (AVLayer)
-                var source = currentLayer.source;
-                if (source instanceof CompItem) {
-                    // Pre-comp có thể kéo dài vì chúng ta đã xử lý source của nó rồi
-                    canExtend = true;
-                } else if (source instanceof FootageItem) {
-                    // FootageItem có thể là Solid hoặc file media
-                    if (source.mainSource instanceof SolidSource) {
-                        // Layer Solid có thể kéo dài
-                        canExtend = true;
-                    } 
-                    // *** CẬP NHẬT LOGIC TẠI ĐÂY ***
-                    // Dấu hiệu nhận biết ảnh tĩnh (PSD, PNG, JPG...) là frameRate của source bằng 0
-                    else if (source.frameRate === 0) {
-                        canExtend = true;
-                    }
-                    // Các loại Footage khác (Video, Audio, Image Sequence...) sẽ không được xử lý
+            if (activeItems[currentLayer.id] && canLayerBeExtended(currentLayer)) {
+                currentLayer.outPoint = newDuration;
+                 if(!compWasModified) {
+                    compWasModified = true;
                 }
             }
-            
-            if (canExtend) {
-                currentLayer.outPoint = newDuration;
-            }
+        }
+
+        if(compWasModified) {
+            processedCount++;
         }
     }
 
-    alert("Hoàn tất!\nĐã xử lý thành công " + compsToProcess.length + " compositions, bắt đầu từ '" + masterComp.name + "'.");
+    alert("Hoàn tất!\nĐã xử lý thành công " + processedCount + " compositions/items, bắt đầu từ '" + masterComp.name + "'.");
 
     app.endUndoGroup();
 
