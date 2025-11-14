@@ -1,0 +1,560 @@
+/*
+  Quick Emote Render (UI)
+  - Version: 1.3.1
+  - Định dạng xuất: do người dùng chọn từ danh sách phát hiện
+  - Nếu định dạng đã chọn không khả dụng, báo lỗi và dừng render
+  - Cho phép custom FPS (mặc định 30)
+  - Render từ comp đang được trỏ (active comp)
+  - Render lần lượt các comp con trực tiếp (không sâu hơn) với tên của comp con
+  - Duration mỗi comp con: từ 0 đến marker đầu tiên của comp con; nếu không có marker, dùng duration của comp con; đảm bảo tối thiểu 1 frame
+*/
+
+(function quickEmoteRenderUI(thisObj) {
+  function isComp(item) { return item && item instanceof CompItem; }
+
+  function getActiveComp() {
+    var p = app.project;
+    if (!p) return null;
+    var it = p.activeItem;
+    return isComp(it) ? it : null;
+  }
+
+  function getChildCompLayersOf(comp) {
+    var list = [];
+    for (var i = 1; i <= comp.numLayers; i++) {
+      var lyr = comp.layer(i);
+      // Direct precomp layer only, and ignore guide layers
+      if (lyr instanceof AVLayer && lyr.source && lyr.source instanceof CompItem && !lyr.guideLayer) {
+        list.push(lyr);
+      }
+    }
+    return list;
+  }
+
+  function firstMarkerTimeOnLayer(layer) {
+    try {
+      var mp = layer.marker;
+      if (mp && mp.numKeys > 0) return mp.keyTime(1);
+    } catch (e) {}
+    return null;
+  }
+
+  function ensureMinDuration(dur, fps, fallbackDur) {
+    var minDur = 1 / Math.max(1, fps || 30);
+    var d = (dur == null || isNaN(dur)) ? fallbackDur : dur;
+    if (d <= 0) d = fallbackDur > 0 ? fallbackDur : minDur;
+    if (d < minDur) d = minDur;
+    return d;
+  }
+
+  // Lấy danh sách tất cả các Output Module template có sẵn
+  function getOutputModuleTemplates() {
+    var templates = [];
+    var rqItem = null, om = null;
+
+    // Helper to find any comp to use for probing templates
+    function findAnyComp() {
+      var p = app.project; if (!p) return null;
+      if (p.activeItem && isComp(p.activeItem)) return p.activeItem;
+      for (var i = 1; i <= p.numItems; i++) { var it = p.item(i); if (isComp(it)) return it; }
+      return null;
+    }
+    var probeComp = findAnyComp();
+    if (!probeComp) return []; // Return empty if no comp is available
+
+    try {
+      rqItem = app.project.renderQueue.items.add(probeComp);
+      om = rqItem.outputModule(1);
+      var omTemplates = om.templates || [];
+      for (var i = 0; i < omTemplates.length; i++) {
+        templates.push(String(omTemplates[i]));
+      }
+      templates.sort();
+    } catch (e) {
+      // Ignore errors during probing
+    } finally {
+      if (rqItem) try { rqItem.remove(); } catch (e) {}
+    }
+    return templates;
+  }
+
+  function renderChildren(options) {
+    var log = options.logFunc || function(msg, type) { /* silent */ };
+    
+    var mainComp = options.mainComp;
+    if (!isComp(mainComp)) {
+        var noCompMsg = 'Comp chính không hợp lệ.';
+        log('Lỗi: ' + noCompMsg);
+        alert(noCompMsg);
+        return;
+    }
+
+    var childLayers = options.layers;
+    if (!childLayers || childLayers.length === 0) {
+      return; // Safeguard
+    }
+
+    var outFolder = options.outFolder;
+    if (!outFolder) {
+      outFolder = Folder.selectDialog('Chọn thư mục lưu file render');
+      if (!outFolder) {
+        log('Đã hủy chọn thư mục xuất.');
+        alert('Đã hủy chọn thư mục xuất.'); return;
+      }
+    }
+
+    var template = options.template ? String(options.template) : '';
+    if (!template) {
+        var msg3 = 'Vui lòng chọn một Output Module template.';
+        log('Lỗi: ' + msg3);
+        alert(msg3); return;
+    }
+
+    var originalFPS = mainComp.frameRate;
+
+    var originalVisibility = [];
+    for (var i = 1; i <= mainComp.numLayers; i++) {
+        var l = mainComp.layer(i);
+        originalVisibility.push({ layer: l, enabled: l.enabled });
+    }
+
+    // Process and render each item one by one
+    for (var i = 0; i < childLayers.length; i++) {
+        var layer = childLayers[i];
+        var comp = layer.source;
+        var fps = options.fpsList[i];
+        var name = options.nameList[i];
+
+        log('Bắt đầu xử lý item ' + (i + 1) + '/' + childLayers.length + ': "' + name + '"');
+        var rqItem = null;
+
+        try {
+            // --- PREPARE ---
+            for (var j = 0; j < originalVisibility.length; j++) {
+                originalVisibility[j].layer.enabled = false;
+            }
+            layer.enabled = true;
+            mainComp.frameRate = fps;
+            
+            // --- QUEUE ---
+            rqItem = app.project.renderQueue.items.add(mainComp);
+            
+            var firstMark = firstMarkerTimeOnLayer(layer);
+            var dur = ensureMinDuration(firstMark, fps, comp.duration);
+            rqItem.timeSpanStart = 0;
+            rqItem.timeSpanDuration = dur;
+            
+            var om = rqItem.outputModule(1);
+            om.applyTemplate(template);
+
+            // Determine output file path
+            var ext = '';
+            // First, try to get extension from the default file name generated by the template
+            try {
+                var defaultFile = om.file;
+                if (defaultFile && defaultFile.name) {
+                    var dot = defaultFile.name.lastIndexOf('.');
+                    // Ensure dot is found and not the first character.
+                    if (dot > 0) {
+                        ext = defaultFile.name.substring(dot + 1);
+                    }
+                }
+            } catch (eFile) {}
+
+            var suffix = options.suffix && String(options.suffix).length > 0 ? options.suffix : 'fix';
+            var base = name;
+            var fileName = base + (ext ? '.' + ext : '');
+            var outFile = new File(outFolder.fsName + '/' + fileName);
+            var counter = 1;
+            while (outFile.exists) {
+                fileName = base + '_' + suffix + counter + (ext ? '.' + ext : '');
+                outFile = new File(outFolder.fsName + '/' + fileName);
+                counter++;
+            }
+            om.file = outFile;
+
+            // --- RENDER (this single item) ---
+            app.project.renderQueue.render();
+            log('Render "' + name + '" thành công.');
+
+        } catch (e) {
+            var errMsg = 'LỖI khi xử lý "' + name + '": ' + e.toString();
+            log(errMsg);
+            alert(errMsg);
+            // Stop processing further items on error
+            break; 
+        } finally {
+            // --- CLEANUP ---
+            if (rqItem && rqItem.status !== RQItemStatus.DELETED) {
+                try { rqItem.remove(); } catch (eRem) {}
+            }
+            
+            mainComp.frameRate = originalFPS;
+            for (var k = 0; k < originalVisibility.length; k++) {
+                if (originalVisibility[k].layer && originalVisibility[k].layer.isValid) {
+                    originalVisibility[k].layer.enabled = originalVisibility[k].enabled;
+                }
+            }
+        }
+    }
+    
+    log('Tất cả đã render hoàn tất!', 'success');
+    // The final alert is removed to avoid confusion, as logs provide better feedback.
+  }
+
+  function buildUI(thisObj) {
+    var win = (thisObj instanceof Panel) ? thisObj : new Window('palette', 'Quick Emote Render', undefined, { resizeable: true });
+    win.alignChildren = 'fill';
+
+    var childCompControls = []; // To store {layer, nameEdit, fpsEdit, infoText, renderChk}
+
+    // Row: Active comp
+    var grpComp = win.add('group');
+    grpComp.orientation = 'row';
+    grpComp.alignment = 'fill';
+    grpComp.add('statictext', undefined, 'Comp đang chọn:');
+    var compNameTxt = grpComp.add('statictext', undefined, '(chưa có)');
+    compNameTxt.preferredSize.width = 180;
+    var spacer1 = grpComp.add('group'); spacer1.alignment = 'fill';
+    var refreshBtn = grpComp.add('button', undefined, 'Chọn Comp');
+
+    // Row: Template selection
+    var grpTpl = win.add('group');
+    grpTpl.orientation = 'row';
+    grpTpl.alignment = 'fill';
+    grpTpl.add('statictext', undefined, 'Output Template:');
+    var tplDropdown = grpTpl.add('dropdownlist', undefined, []);
+    tplDropdown.minimumSize.width = 180;
+    var spacer2 = grpTpl.add('group'); spacer2.alignment = 'fill';
+    var refreshTplBtn = grpTpl.add('button', undefined, 'Làm mới DS');
+    
+    // Panel: Child comps to be rendered
+    var childCompsPanel = win.add('panel', undefined, 'Các comp con sẽ được render:');
+    childCompsPanel.alignment = 'fill';
+    childCompsPanel.orientation = 'column';
+    childCompsPanel.alignChildren = 'left';
+    childCompsPanel.preferredSize.height = 100;
+    
+    // Panel: Log
+    var logPanel = win.add('panel', undefined, 'Log');
+    logPanel.alignment = 'fill';
+    logPanel.orientation = 'column'; // Added for consistency
+    logPanel.alignChildren = 'left'; // Added for consistency
+    var logList = logPanel.add('listbox', undefined, [], {
+        numberOfColumns: 2,
+        showHeaders: true,
+        columnTitles: ['Time', 'Message'],
+        columnWidths: [60, 250]
+    });
+    logList.preferredSize.height = 150;
+    logList.alignment = 'fill';
+
+    function addLog(message, type) {
+        var d = new Date();
+        var timeStr = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+        var newItem = logList.add('item', timeStr);
+        
+        // ScriptUI does not easily support colored listbox items.
+        // As a workaround, we add a success indicator.
+        if (type === 'success') {
+            newItem.subItems[0].text = '✅ ' + message;
+        } else {
+            newItem.subItems[0].text = message;
+        }
+        
+        if (logList.items.length > 100) { // Keep max 100 log entries
+            logList.remove(logList.items[0]);
+        }
+        
+        logList.revealItem(newItem); // Scroll to the new item
+    }
+    addLog("Giao diện sẵn sàng.");
+
+    // Row: Suffix for duplicate filenames
+    var grpSuffix = win.add('group');
+    grpSuffix.orientation = 'row';
+    grpSuffix.add('statictext', undefined, 'Hậu tố khi trùng tên:');
+    var suffixEdit = grpSuffix.add('edittext', undefined, 'fix');
+    suffixEdit.helpTip = 'Phần chữ thêm vào tên file nếu bị trùng, ví dụ: tenfile_[fix]1.mov';
+    suffixEdit.characters = 10;
+
+    grpSuffix.add('statictext', undefined, '  Render folder:');
+    var renderFolderName = 'RENDER'; // default
+    if (app.settings.haveSetting("QuickEmoteRender", "RenderFolderName")) {
+        renderFolderName = String(app.settings.getSetting("QuickEmoteRender", "RenderFolderName")) || renderFolderName;
+    }
+    var renderFolderEdit = grpSuffix.add('edittext', undefined, renderFolderName);
+    renderFolderEdit.helpTip = 'Tên thư mục con để chứa file render, sẽ được tạo trong thư mục của project.';
+    renderFolderEdit.characters = 10;
+    renderFolderEdit.onChange = function() {
+        var newFolderName = this.text || 'RENDER';
+        app.settings.saveSetting("QuickEmoteRender", "RenderFolderName", newFolderName);
+        try {
+            if (app.project && app.project.file) {
+                var newPath = app.project.file.parent.fsName + '/' + newFolderName;
+                outEdit.text = newPath;
+            }
+        } catch(e) {
+            // ignore if project not saved
+        }
+    };
+
+    // Row: Output folder
+    var grpOut = win.add('group');
+    grpOut.orientation = 'row';
+    grpOut.alignment = 'fill';
+    grpOut.add('statictext', undefined, 'Thư mục xuất:');
+    // Mặc định: <project_dir>/<Render folder>/ (tạo nếu chưa tồn tại); nếu project chưa lưu thì để trống
+    var defaultOutPath = '';
+    try {
+      if (app.project && app.project.file) {
+        defaultOutPath = app.project.file.parent.fsName + '/' + renderFolderEdit.text;
+        var movFolder = new Folder(defaultOutPath);
+        if (!movFolder.exists) movFolder.create();
+      }
+    } catch (eDefault) {}
+    var outEdit = grpOut.add('edittext', undefined, defaultOutPath);
+    outEdit.preferredSize.width = 180;
+    var browseBtn = grpOut.add('button', undefined, 'Chọn...');
+    var spacer3 = grpOut.add('group'); spacer3.alignment = 'fill';
+    var renderBtn = grpOut.add('button', undefined, 'Render');
+
+    function updateChildCompsList() {
+        while (childCompsPanel.children.length > 0) {
+            childCompsPanel.remove(childCompsPanel.children[0]);
+        }
+        childCompControls = []; // Clear the controls array
+        
+        var c = getActiveComp();
+        if (!c) {
+            childCompsPanel.add('statictext', undefined, 'Vui lòng chọn một comp chính chứa các comp con.');
+            if (win.layout) win.layout.layout(true);
+            return;
+        }
+        var childLayers = getChildCompLayersOf(c);
+        if (childLayers.length === 0) {
+            childCompsPanel.add('statictext', undefined, 'Comp đã chọn không có comp con trực tiếp nào.');
+            if (win.layout) win.layout.layout(true);
+            return;
+        }
+
+        for (var i = 0; i < childLayers.length; i++) {
+            var layer = childLayers[i];
+            var comp = layer.source;
+            
+            var itemGroup = childCompsPanel.add('group');
+            itemGroup.orientation = 'row';
+            itemGroup.alignment = 'left';
+
+            var renderChk = itemGroup.add('checkbox', undefined, '');
+            renderChk.value = true;
+            renderChk.helpTip = 'Bỏ chọn để không render comp này';
+
+            itemGroup.add('statictext', undefined, (i + 1) + '.');
+            var nameEdit = itemGroup.add('edittext', undefined, layer.name);
+            nameEdit.preferredSize.width = 150;
+
+            itemGroup.add('statictext', undefined, 'FPS:');
+            var fpsEdit = itemGroup.add('edittext', undefined, String(comp.frameRate));
+            fpsEdit.characters = 6;
+
+            var firstMark = firstMarkerTimeOnLayer(layer);
+            var initialFps = comp.frameRate;
+            var dur = ensureMinDuration(firstMark, initialFps, comp.duration);
+            var frameCount = Math.round(dur * initialFps);
+            var infoText = itemGroup.add('statictext', undefined, ' (' + dur.toFixed(2) + 's, ' + frameCount + ' frames)');
+
+            var control = { layer: layer, comp: comp, nameEdit: nameEdit, fpsEdit: fpsEdit, infoText: infoText, renderChk: renderChk };
+            childCompControls.push(control);
+
+            // Closure to capture the correct control object
+            (function(currentControl) {
+                currentControl.nameEdit.onChange = function() {
+                    var newName = this.text;
+                    if (newName && newName !== currentControl.layer.name) {
+                        try {
+                            app.beginUndoGroup("Rename Layer");
+                            currentControl.layer.name = newName;
+                            app.endUndoGroup();
+                        } catch(e) {
+                            alert("Lỗi đổi tên layer: " + e.message);
+                            this.text = currentControl.layer.name; // Revert
+                        }
+                    }
+                };
+
+                currentControl.fpsEdit.onChanging = function() {
+                    var newFps = parseFloat(this.text) || 0;
+                    if (newFps > 0) {
+                        var firstMark = firstMarkerTimeOnLayer(currentControl.layer);
+                        var dur = ensureMinDuration(firstMark, newFps, currentControl.comp.duration);
+                        var frameCount = Math.round(dur * newFps);
+                        currentControl.infoText.text = ' (' + dur.toFixed(2) + 's, ' + frameCount + ' frames)';
+                    }
+                };
+            })(control);
+        }
+        if (win.layout) win.layout.layout(true);
+    }
+    
+    function updateAllInfo() {
+      var c = getActiveComp();
+      compNameTxt.text = c ? (c.name + ' (' + c.width + 'x' + c.height + ')') : '(không phải Comp)';
+      updateChildCompsList();
+    }
+
+    refreshBtn.onClick = updateAllInfo;
+
+    browseBtn.onClick = function () {
+      var startFolder = null;
+      var currentPath = outEdit.text;
+
+      if (currentPath) {
+          var f = new Folder(currentPath);
+          if (f.exists) {
+              startFolder = f;
+          }
+      }
+
+      if (!startFolder) {
+          if (app.project && app.project.file) {
+              startFolder = app.project.file.parent;
+          }
+      }
+
+      var selectedFolder;
+      if (startFolder && startFolder.exists) {
+          selectedFolder = startFolder.selectDlg('Chọn thư mục lưu file render');
+      } else {
+          selectedFolder = Folder.selectDialog('Chọn thư mục lưu file render');
+      }
+      
+      if (selectedFolder) {
+        outEdit.text = selectedFolder.fsName;
+      }
+    };
+
+    function populateTemplates() {
+      try {
+        var templates = getOutputModuleTemplates();
+        tplDropdown.removeAll();
+        for (var i = 0; i < templates.length; i++) {
+          tplDropdown.add('item', templates[i]);
+        }
+        if (tplDropdown.items.length > 0) {
+          // Ưu tiên template có "emote", sau đó là "Lossless", nếu không có thì chọn item đầu tiên
+          var emoteIndex = -1;
+          var losslessIndex = -1;
+          for (var j = 0; j < tplDropdown.items.length; j++) {
+            var tplName = String(tplDropdown.items[j].text).toLowerCase();
+            if (tplName.indexOf('emote') >= 0) {
+              emoteIndex = j;
+              break; // Tìm thấy ưu tiên cao nhất, dừng lại
+            }
+            if (losslessIndex < 0 && tplName.indexOf('lossless') >= 0) {
+              losslessIndex = j;
+            }
+          }
+          
+          var selectedIndex = 0; // Mặc định là item đầu tiên
+          if (emoteIndex >= 0) {
+            selectedIndex = emoteIndex;
+          } else if (losslessIndex >= 0) {
+            selectedIndex = losslessIndex;
+          }
+          tplDropdown.selection = tplDropdown.items[selectedIndex];
+        }
+      } catch (e) {
+        alert('Lỗi khi tải danh sách template: ' + e);
+      }
+    }
+
+    refreshTplBtn.onClick = function() {
+      alert('Đang quét lại danh sách Output Module template...');
+      populateTemplates();
+      alert('Đã làm mới danh sách.');
+    };
+
+    renderBtn.onClick = function () {
+      try {
+        var folderPath = outEdit.text && outEdit.text.length ? new Folder(outEdit.text) : null;
+        if (folderPath && !folderPath.exists) {
+          if (!folderPath.create()) {
+            var cantCreate = 'Không thể tạo thư mục xuất: ' + folderPath.fsName;
+            addLog('Lỗi: ' + cantCreate);
+            alert(cantCreate);
+            return;
+          }
+        }
+        if (!folderPath) {
+          var fsel = Folder.selectDialog('Chọn thư mục lưu file render');
+          if (!fsel) {
+            addLog('Đã hủy chọn thư mục xuất.');
+            return; // No alert needed, log is sufficient
+          }
+          folderPath = fsel;
+          outEdit.text = fsel.fsName; // Update UI
+        }
+        var selTpl = (tplDropdown && tplDropdown.selection) ? String(tplDropdown.selection.text) : '';
+        
+        var activeComp = getActiveComp();
+        if (!activeComp) {
+            var noCompMsg = 'Vui lòng chọn một comp chính chứa các comp con.';
+            addLog(noCompMsg);
+            alert(noCompMsg);
+            return;
+        }
+
+        var layersToRender = [];
+        var fpsList = [];
+        var nameList = [];
+        for (var i = 0; i < childCompControls.length; i++) {
+            var ctrl = childCompControls[i];
+            if (ctrl.renderChk.value) {
+                layersToRender.push(ctrl.layer);
+                fpsList.push(parseFloat(ctrl.fpsEdit.text) || ctrl.comp.frameRate);
+                nameList.push(ctrl.nameEdit.text);
+            }
+        }
+
+        if (layersToRender.length === 0) {
+            var noSelectionMsg = 'Không có comp con nào được chọn để render.';
+            addLog(noSelectionMsg);
+            alert(noSelectionMsg);
+            return;
+        }
+
+        addLog("Bắt đầu quá trình render tuần tự...");
+        renderChildren({
+          mainComp: activeComp,
+          layers: layersToRender,
+          outFolder: folderPath,
+          template: selTpl,
+          suffix: suffixEdit.text,
+          logFunc: addLog,
+          fpsList: fpsList,
+          nameList: nameList
+        });
+      } catch (e) {
+        var errMsg = 'Lỗi khi thực thi Render: ' + e;
+        addLog(errMsg);
+        alert(errMsg);
+      }
+    };
+    
+    // Initial population
+    updateAllInfo();
+    populateTemplates();
+
+    win.layout.layout(true);
+    win.onResizing = win.onResize = function () { this.layout.resize(); };
+
+    if (!(thisObj instanceof Panel)) win.center();
+    return win;
+  }
+
+  var ui;
+  try { ui = buildUI(thisObj); } catch (eBuild) { alert('UI build error: ' + eBuild); return; }
+  try { if (ui instanceof Window) ui.show(); } catch (eInit) { alert('UI init error: ' + eInit); }
+
+})(this);
